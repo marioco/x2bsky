@@ -1,0 +1,11 @@
+[Unit]
+Description=Run x2bsky every 5 minutes
+Requires=x2bsky.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=x2bsky.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=x2bsky - X to Bluesky Crossposter
+After=network.target
+
+[Service]
+Type=simple
+User=crossposter
+WorkingDirectory=/home/crossposter/x2bsky-repo
+Environment="PATH=/home/crossposter/x2bsky-repo/venv/bin"
+ExecStart=/home/crossposter/x2bsky-repo/venv/bin/python /home/crossposter/x2bsky-repo/x2bsky.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
