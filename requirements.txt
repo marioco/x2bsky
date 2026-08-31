@@ -1,6 +1,5 @@
-atproto
-python-dotenv
-feedparser
-requests
-beautifulsoup4
-lxml
+atproto>=0.0.69,<0.1
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+Pillow>=10,<13
+requests>=2.31,<3

@@ -1,15 +1,24 @@
 [Unit]
-Description=x2bsky - X to Bluesky Crossposter
-After=network.target
+Description=X-to-Bluesky Crossposter
+Wants=network-online.target
+After=network-online.target
 
 [Service]
-Type=simple
-User=crossposter
-WorkingDirectory=/home/crossposter/x2bsky-repo
-Environment="PATH=/home/crossposter/x2bsky-repo/venv/bin"
-ExecStart=/home/crossposter/x2bsky-repo/venv/bin/python /home/crossposter/x2bsky-repo/x2bsky.py
-Restart=on-failure
-RestartSec=30
+Type=oneshot
+User=x2bsky
+Group=x2bsky
+WorkingDirectory=/opt/x2bsky
+Environment=HOME=/var/lib/x2bsky
+Environment=XSO_HOME_DIR=/var/lib/x2bsky
+Environment=XSO_SCRIPTS_DIR=/opt/x2bsky
+Environment=XSO_SCREEN_NAME=GFreiNews
+Environment=XSO_MY_DOMAINS=gfrei.news
+Environment=XSO_FALLBACK_URL=https://gfrei.news
+ExecStart=/opt/x2bsky/.venv/bin/python /opt/x2bsky/x2bsky.py
+TimeoutStartSec=45min
+Nice=10
+IOSchedulingClass=idle
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
