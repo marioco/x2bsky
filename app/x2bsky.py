@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001
 """
-5030_bluesky.py
+x2bsky.py
 
 Ziel ist ein konfigurierbares Bluesky-Konto.
 Keine Videos. Höchstens 4 Bilder. Text max. 300 Zeichen (Bluesky).
@@ -11,23 +12,20 @@ Eigenständiger Einstieg: x2bsky.py
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
+import sys
 import time
+import traceback
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import requests
 from atproto import Client
-
-SCRIPT_PATH = Path(__file__).resolve()
-HOME_DIR = Path(os.environ.get("XSO_HOME_DIR") or Path.home()).resolve()
-SCRIPTS_DIR = Path(os.environ.get("XSO_SCRIPTS_DIR") or SCRIPT_PATH.parent).resolve()
-CREDS_DIR = HOME_DIR / "creds"
-LOG_DIR = HOME_DIR / "logs"
-TMP_DIR = HOME_DIR / "tmp"
-
-from xso_common import (
+from PIL import Image
+from x2bsky_common import (
     collect_posts,
     compose_caption,
     enrich_post,
@@ -43,37 +41,39 @@ from xso_common import (
     select_new_posts,
     skip_reason,
     unused_photos,
+    validate_configuration,
 )
 
-MAX_LOG_BYTES = 25_000
-try:
-    LOG_FILE = (LOG_DIR / SCRIPT_PATH.relative_to(SCRIPTS_DIR)).with_suffix(".log")
-except ValueError:
-    LOG_FILE = LOG_DIR / "projekte" / "xtosocialmedia" / f"{SCRIPT_PATH.stem}.log"
-LOG_OLD = LOG_FILE.with_suffix(".old")
-for _d in (LOG_FILE.parent, TMP_DIR):
-    try:
-        _d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        logging.getLogger(__name__).debug(
-            "Nichtkritischer Fehler wird bewusst ignoriert",
-            exc_info=True,
-        )
+RUNTIME_DIR = Path(
+    os.environ.get("X2BSKY_RUNTIME_DIR")
+    or (Path.home() / ".local" / "share" / "x2bsky")
+).resolve()
+CREDS_DIR = RUNTIME_DIR / "credentials"
+LOG_DIR = RUNTIME_DIR / "logs"
+TMP_DIR = RUNTIME_DIR / "tmp"
 
-PLATFORM = "bluesky"
+MAX_LOG_BYTES = 25_000
+LOG_FILE = LOG_DIR / "x2bsky.log"
+LOG_OLD = LOG_FILE.with_suffix(".old")
+LOCK_FILE = RUNTIME_DIR / "state" / "run.lock"
+
 BSKY_TEXT_MAX = 300
 BSKY_MAX_IMAGES = 4
 BSKY_MAX_IMAGE_BYTES = 1_000_000
 
 session = requests.Session()
-session.headers.update({"User-Agent": "LauraXsoBluesky/1"})
+session.headers.update({"User-Agent": "x2bsky/2"})
 _HANDLE = ""
-_PASSWORD = ""
+_REDACTION_SECRET: str | None = None
 _CLIENT: Client | None = None
 
 
 def log(msg: str) -> None:
-    if LOG_FILE.is_file() and LOG_FILE.stat().st_size > MAX_LOG_BYTES:
+    try:
+        rotate = LOG_FILE.is_file() and LOG_FILE.stat().st_size > MAX_LOG_BYTES
+    except OSError:
+        rotate = False
+    if rotate:
         try:
             if LOG_OLD.exists():
                 LOG_OLD.unlink()
@@ -83,34 +83,58 @@ def log(msg: str) -> None:
                 "Nichtkritischer Fehler wird bewusst ignoriert",
                 exc_info=True,
             )
-    line = f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] {redact(msg, _PASSWORD)}"
+    line = (
+        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] "
+        f"{redact(msg, _REDACTION_SECRET)}"
+    )
     try:
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-    except OSError:
-        logging.getLogger(__name__).debug(
-            "Nichtkritischer Fehler wird bewusst ignoriert",
-            exc_info=True,
-        )
+    except OSError as exc:
+        print(f"WARNUNG: Logdatei nicht schreibbar: {exc}", file=sys.stderr)
     print(line)
 
 
+def prepare_runtime() -> None:
+    """Create writable runtime directories before logging or state access."""
+    for directory in (LOG_DIR, TMP_DIR, LOCK_FILE.parent):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Laufzeitverzeichnis nicht anlegbar: {directory}: {exc}"
+            ) from exc
+
+
+def acquire_run_lock():
+    """Prevent concurrent manual, timer and installer runs."""
+    try:
+        handle = LOCK_FILE.open("a", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError("x2bsky läuft bereits") from None
+    except OSError as exc:
+        raise RuntimeError(f"Lauf-Lock nicht verfügbar: {LOCK_FILE}: {exc}") from exc
+    return handle
+
+
 def load_bluesky_creds() -> tuple[str, str]:
-    path = CREDS_DIR / "_bluesky_gfrei.txt"
+    path = CREDS_DIR / "bluesky.credentials"
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise FileNotFoundError(f"_bluesky_gfrei.txt fehlt: {path}") from None
+        raise FileNotFoundError(f"bluesky.credentials fehlt: {path}") from None
     except OSError as exc:
-        raise RuntimeError(f"_bluesky_gfrei.txt unlesbar: {exc}") from exc
+        raise RuntimeError(f"bluesky.credentials unlesbar: {exc}") from exc
     lines = [
         ln.strip()
         for ln in raw.splitlines()
         if ln.strip() and not ln.lstrip().startswith("#")
     ]
-    if len(lines) < 2 or not lines[0] or not lines[1]:
+    if len(lines) != 2 or not lines[0] or not lines[1]:
         raise RuntimeError(
-            "_bluesky_gfrei.txt braucht 2 nichtleere Zeilen: Handle, App-Passwort"
+            "bluesky.credentials braucht genau 2 nichtleere Zeilen: Handle, App-Passwort"
         )
     return lines[0], lines[1]
 
@@ -121,14 +145,8 @@ def bluesky_caption(text: str, link: str, log_fn=None) -> str:
         link = ""
     room = BSKY_TEXT_MAX - (len(link) + 1 if link else 0)
     room = max(room, 8)
-    try:
-        raw = compose_caption(text, "", has_photo=False, log_fn=log_fn)
-    except Exception:
-        raw = text or ""
-    try:
-        body = fit_text(raw, room, log_fn=log_fn)
-    except Exception:
-        body = hard_trim(raw, room)
+    raw = compose_caption(text, "", log_fn=log_fn)
+    body = fit_text(raw, room, log_fn=log_fn)
     if link and link not in body:
         cap = f"{body}\n{link}".strip()
     else:
@@ -146,10 +164,6 @@ def shrink_image(data: bytes) -> bytes | None:
     if data and len(data) <= BSKY_MAX_IMAGE_BYTES:
         return data
     try:
-        from io import BytesIO
-
-        from PIL import Image
-
         img = Image.open(BytesIO(data))
         img.load()
         if img.mode not in ("RGB", "L"):
@@ -168,7 +182,7 @@ def shrink_image(data: bytes) -> bytes | None:
             cand = buf.getvalue()
             if cand and len(cand) <= BSKY_MAX_IMAGE_BYTES:
                 return cand
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         log(f"Bild verkleinern: {exc}")
         return None
     return None
@@ -188,7 +202,7 @@ def download_image(url: str) -> bytes | None:
         ):
             return None
         return shrink_image(data)
-    except Exception as exc:
+    except requests.RequestException as exc:
         log(f"Bild holen: {exc}")
         return None
 
@@ -199,16 +213,6 @@ def _is_timeout(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
     if "timeout" in name:
         return True
-    try:
-        import httpx
-
-        if isinstance(exc, httpx.TimeoutException):
-            return True
-    except Exception:
-        logging.getLogger(__name__).debug(
-            "Nichtkritischer Fehler wird bewusst ignoriert",
-            exc_info=True,
-        )
     return "timeout" in str(exc).lower()
 
 
@@ -275,7 +279,7 @@ def bsky_send_images(text: str, photo_urls: list[str]) -> str:
     return "photos"
 
 
-def send_post(post, caption: str, photos: list[str]) -> str:
+def send_post(caption: str, photos: list[str]) -> str:
     if photos:
         try:
             return bsky_send_images(caption, photos)
@@ -290,22 +294,37 @@ def send_post(post, caption: str, photos: list[str]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="X nach Bluesky")
-    p.add_argument("--dry-run", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument(
+        "--check-login",
+        action="store_true",
+        help="Bluesky-Anmeldung prüfen, ohne Posts zu lesen oder zu senden",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    global _HANDLE, _PASSWORD, _CLIENT
+    global _HANDLE, _REDACTION_SECRET, _CLIENT
     args = parse_args(argv)
-    dry = args.dry_run or (os.environ.get("XSO_DRY") or "").strip().lower() in (
+    dry = args.dry_run or (os.environ.get("X2BSKY_DRY_RUN") or "").strip().lower() in (
         "1",
         "true",
         "yes",
     )
-    log("=== 5030_bluesky gestartet ===")
+    lock_handle = None
     try:
-        _HANDLE, _PASSWORD = load_bluesky_creds()
-        state = load_state(log_fn=log, platform=PLATFORM)
+        prepare_runtime()
+        lock_handle = acquire_run_lock()
+        log("=== x2bsky gestartet ===")
+        validate_configuration()
+        _HANDLE, _REDACTION_SECRET = load_bluesky_creds()
+        if args.check_login:
+            _CLIENT = Client()
+            _CLIENT.login(_HANDLE, _REDACTION_SECRET)
+            log("Bluesky-Anmeldung erfolgreich geprüft")
+            return 0
+        state = load_state(log_fn=log)
         posts = collect_posts(log_fn=log)
         batch = select_new_posts(posts, state)
         log(
@@ -318,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         if not dry:
             try:
                 _CLIENT = Client()
-                _CLIENT.login(_HANDLE, _PASSWORD)
+                _CLIENT.login(_HANDLE, _REDACTION_SECRET)
                 log("Bluesky angemeldet")
             except Exception as exc:
                 raise RuntimeError(f"Bluesky-Anmeldung fehlgeschlagen: {exc}") from exc
@@ -330,17 +349,13 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"SKIP {post.id} {reason}")
                 if not dry:
                     mark_seen(state, post.id)
-                    save_state(state, platform=PLATFORM)
+                    save_state(state)
                 continue
             try:
                 enrich_post(post, log_fn=log)
             except Exception as exc:
                 log(f"status-html {post.id}: {exc}")
-            try:
-                link = select_link(post.urls)
-            except Exception as exc:
-                log(f"link {post.id}: {exc}")
-                link = "https://GFrei.News"
+            link = select_link(post.urls)
             photos = unused_photos(state, post.photos)[:BSKY_MAX_IMAGES]
             skipped = len(post.photos) - len(photos)
             if skipped:
@@ -351,15 +366,9 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"SKIP {post.id} leer")
                 if not dry:
                     mark_seen(state, post.id)
-                    save_state(state, platform=PLATFORM)
+                    save_state(state)
                 continue
-            try:
-                caption = bluesky_caption(post.text, link, log_fn=log)
-            except Exception as exc:
-                log(f"Caption {post.id}: {exc}")
-                caption = hard_trim(
-                    (post.text or "") + ("\n" + link if link else ""), BSKY_TEXT_MAX
-                )
+            caption = bluesky_caption(post.text, link, log_fn=log)
             if dry:
                 log(
                     f"DRY {post.id} @{post.author} photos={len(photos)} "
@@ -369,11 +378,11 @@ def main(argv: list[str] | None = None) -> int:
                 sent += 1
                 continue
             try:
-                kind = send_post(post, caption, photos)
+                kind = send_post(caption, photos)
                 if photos and kind.startswith("photos"):
                     remember_images(state, photos)
                 mark_seen(state, post.id)
-                save_state(state, platform=PLATFORM)
+                save_state(state)
                 log(
                     f"SENT {post.id} type={kind} photos={len(photos)} len={len(caption)}"
                 )
@@ -385,13 +394,16 @@ def main(argv: list[str] | None = None) -> int:
         log(f"fertig gesendet={sent}")
         return 0
     except Exception as exc:
-        log(f"FEHLER: {exc}")
-        import traceback
-
+        if LOG_DIR.is_dir():
+            log(f"FEHLER: {exc}")
+        else:
+            print(f"FEHLER: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
     finally:
-        log("=== 5030_bluesky beendet ===")
+        if lock_handle is not None:
+            log("=== x2bsky beendet ===")
+            lock_handle.close()
 
 
 if __name__ == "__main__":

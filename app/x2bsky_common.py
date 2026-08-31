@@ -21,25 +21,27 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-SCRIPT_PATH = Path(__file__).resolve()
-HOME_DIR = Path(os.environ.get("XSO_HOME_DIR") or Path.home()).resolve()
-SCRIPTS_DIR = Path(os.environ.get("XSO_SCRIPTS_DIR") or SCRIPT_PATH.parent).resolve()
-TMP_DIR = HOME_DIR / "tmp"
-STATE_DIR = TMP_DIR / "xtosocialmedia"
+RUNTIME_DIR = Path(
+    os.environ.get("X2BSKY_RUNTIME_DIR")
+    or (Path.home() / ".local" / "share" / "x2bsky")
+).resolve()
+STATE_DIR = RUNTIME_DIR / "state"
 
-SCREEN_NAME = (os.environ.get("XSO_SCREEN_NAME") or "GFreiNews").strip().lstrip("@")
+SCREEN_NAME = (os.environ.get("X2BSKY_X_USERNAME") or "").strip().lstrip("@")
 MY_DOMAINS = [
     d.strip().lower()
-    for d in (os.environ.get("XSO_MY_DOMAINS") or "gfrei.news").split(",")
+    for d in (os.environ.get("X2BSKY_MY_DOMAINS") or "").split(",")
     if d.strip()
 ]
-FALLBACK_URL = os.environ.get("XSO_FALLBACK_URL") or "https://GFrei.News"
-INCLUDE_RETWEETS = (os.environ.get("XSO_INCLUDE_RETWEETS") or "1").strip().lower() in (
+FALLBACK_URL = (os.environ.get("X2BSKY_FALLBACK_URL") or "").strip()
+INCLUDE_RETWEETS = (
+    os.environ.get("X2BSKY_INCLUDE_RETWEETS") or "1"
+).strip().lower() in (
     "1",
     "true",
     "yes",
 )
-INCLUDE_REPLIES = (os.environ.get("XSO_INCLUDE_REPLIES") or "0").strip().lower() in (
+INCLUDE_REPLIES = (os.environ.get("X2BSKY_INCLUDE_REPLIES") or "0").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -47,11 +49,23 @@ INCLUDE_REPLIES = (os.environ.get("XSO_INCLUDE_REPLIES") or "0").strip().lower()
 # Quotes und Videos: hart verboten – kein Env-Override (nie transportieren)
 INCLUDE_QUOTES = False
 INCLUDE_VIDEOS = False
-INCLUDE_POLLS = (os.environ.get("XSO_INCLUDE_POLLS") or "0").strip().lower() in (
+INCLUDE_POLLS = (os.environ.get("X2BSKY_INCLUDE_POLLS") or "0").strip().lower() in (
     "1",
     "true",
     "yes",
 )
+
+
+def validate_configuration() -> None:
+    """Validate all non-secret settings supplied by the installer."""
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", SCREEN_NAME):
+        raise RuntimeError("X2BSKY_X_USERNAME fehlt oder ist ungültig")
+    parsed_fallback = urllib.parse.urlparse(FALLBACK_URL)
+    if parsed_fallback.scheme != "https" or not parsed_fallback.netloc:
+        raise RuntimeError("X2BSKY_FALLBACK_URL muss eine vollständige HTTPS-URL sein")
+    for domain in MY_DOMAINS:
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", domain) or domain.startswith("."):
+            raise RuntimeError(f"Ungültige Domain in X2BSKY_MY_DOMAINS: {domain}")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -65,7 +79,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 # Stündlicher Lauf: ein paar Posts pro Stunde, kein Stau über den Tag.
-MAX_PER_RUN = max(1, _env_int("XSO_MAX_PER_RUN", 6))
+MAX_PER_RUN = max(1, _env_int("X2BSKY_MAX_PER_RUN", 6))
 SEEN_LIMIT = 500
 IMAGE_SEEN_LIMIT = 2000
 
@@ -120,7 +134,7 @@ def _log(fn: LogFn, msg: str) -> None:
         )
 
 
-def redact(msg: str, secret: str = "") -> str:
+def redact(msg: str, secret: str | None = None) -> str:
     s = str(msg)
     if secret:
         s = s.replace(secret, "…TOKEN…")
@@ -167,7 +181,7 @@ def fetch_html(
                 time.sleep(0.6)
                 continue
             return r.text
-        except Exception as exc:
+        except requests.RequestException as exc:
             last_err = exc
             time.sleep(0.6 * (attempt + 1))
     _log(log_fn, f"fetch fail {url}: {last_err}")
@@ -241,10 +255,7 @@ def _uniq(items: Iterable[str]) -> list[str]:
 
 
 def parse_x_profile_html(page: str) -> list[Post]:
-    try:
-        soup = BeautifulSoup(page or "", "html.parser")
-    except Exception:
-        return []
+    soup = BeautifulSoup(page or "", "html.parser")
     posts: list[Post] = []
     seen: set[str] = set()
     for art in soup.find_all("article"):
@@ -534,11 +545,7 @@ def collect_posts(log_fn: LogFn = None) -> list[Post]:
     posts: list[Post] = []
     x_html = fetch_html(PROFILE_URL, log_fn=log_fn)
     if x_html:
-        try:
-            got = parse_x_profile_html(x_html)
-        except Exception as exc:
-            _log(log_fn, f"x.com parse: {exc}")
-            got = []
+        got = parse_x_profile_html(x_html)
         _log(log_fn, f"x.com HTML: {len(got)} Posts")
         posts = merge_posts(got, [])
     else:
@@ -546,11 +553,7 @@ def collect_posts(log_fn: LogFn = None) -> list[Post]:
     if not posts:
         synd_html = fetch_html(SYND_URL, log_fn=log_fn)
         if synd_html:
-            try:
-                got = parse_syndication_html(synd_html, log_fn=log_fn)
-            except Exception as exc:
-                _log(log_fn, f"syndication parse: {exc}")
-                got = []
+            got = parse_syndication_html(synd_html, log_fn=log_fn)
             _log(log_fn, f"syndication HTML: {len(got)} Posts")
             posts = merge_posts(posts, got)
         else:
@@ -591,7 +594,7 @@ def fetch_fxtwitter(
                 or tw.get("media")
             ):
                 return tw
-        except Exception as exc:
+        except (requests.RequestException, TypeError, ValueError) as exc:
             _log(log_fn, f"fxtwitter {post_id}: {exc}")
     return None
 
@@ -626,10 +629,19 @@ def apply_fxtwitter(post: Post, tw: dict[str, Any], log_fn: LogFn = None) -> Non
                 post.is_video = True
             elif mtype == "photo" or md.get("url") or md.get("thumbnail_url"):
                 pic = md.get("thumbnail_url") or md.get("url") or ""
-                if pic and "video.twimg.com" not in pic and not pic.endswith(".mp4"):
-                    if "pbs.twimg.com" in pic or mtype == "photo":
-                        post.photos = _dedupe_photos(post.photos + [normalize_pbs(pic)])
-    for u in tw.get("mediaURLs") or []:
+                if (
+                    pic
+                    and "video.twimg.com" not in pic
+                    and not pic.endswith(".mp4")
+                    and ("pbs.twimg.com" in pic or mtype == "photo")
+                ):
+                    post.photos = _dedupe_photos(post.photos + [normalize_pbs(pic)])
+    media_urls = tw.get("mediaURLs") or []
+    if isinstance(media_urls, str):
+        media_urls = [media_urls]
+    if not isinstance(media_urls, list):
+        media_urls = []
+    for u in media_urls:
         su = str(u)
         if _looks_like_video_url(su):
             post.is_video = True
@@ -640,12 +652,9 @@ def apply_fxtwitter(post: Post, tw: dict[str, Any], log_fn: LogFn = None) -> Non
 def enrich_post(post: Post, log_fn: LogFn = None) -> None:
     """Reichert Text/Media an: fxtwitter (Volltext) + optional Status-HTML."""
     # 1) fxtwitter/vxtwitter – oft vollständiger als x.com-HTML-Meta
-    try:
-        tw = fetch_fxtwitter(post.id, post.author or SCREEN_NAME, log_fn=log_fn)
-        if tw:
-            apply_fxtwitter(post, tw, log_fn=log_fn)
-    except Exception as exc:
-        _log(log_fn, f"fxtwitter enrich: {exc}")
+    tw = fetch_fxtwitter(post.id, post.author or SCREEN_NAME, log_fn=log_fn)
+    if tw:
+        apply_fxtwitter(post, tw, log_fn=log_fn)
 
     # 2) Status-HTML (Fallback / Ergänzung)
     page = fetch_html(STATUS_URL.format(id=post.id), timeout=15, tries=2, log_fn=log_fn)
@@ -671,9 +680,7 @@ def enrich_post(post: Post, log_fn: LogFn = None) -> None:
         break
     # og:description als letzter Fallback wenn noch kurz
     try:
-        from bs4 import BeautifulSoup as _BS
-
-        soup = _BS(page, "lxml")
+        soup = BeautifulSoup(page, "lxml")
         for prop in ("og:description", "twitter:description"):
             for el in soup.find_all("meta"):
                 p = (el.get("property") or el.get("name") or "").lower()
@@ -682,7 +689,7 @@ def enrich_post(post: Post, log_fn: LogFn = None) -> None:
                     if desc and (not post.text or len(desc) > len(post.text)):
                         post.text = desc
                         post.urls = _uniq(post.urls + extract_urls_from_text(desc))
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         logging.getLogger(__name__).debug(
             "Nichtkritischer Fehler wird bewusst ignoriert",
             exc_info=True,
@@ -698,7 +705,7 @@ def expand_url(url: str) -> str:
         r = session.head(u, allow_redirects=True, timeout=10)
         if r.url:
             return r.url
-    except Exception:
+    except requests.RequestException:
         logging.getLogger(__name__).debug(
             "Nichtkritischer Fehler wird bewusst ignoriert",
             exc_info=True,
@@ -706,37 +713,25 @@ def expand_url(url: str) -> str:
     try:
         r = session.get(u, allow_redirects=True, timeout=12, stream=True)
         final = r.url or u
-        try:
-            r.close()
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "Nichtkritischer Fehler wird bewusst ignoriert",
-                exc_info=True,
-            )
+        r.close()
         return final
-    except Exception:
+    except requests.RequestException:
         return u
 
 
 def netloc_of(url: str) -> str:
-    try:
-        return urllib.parse.urlparse(url).netloc.split(":")[0].lower()
-    except Exception:
-        return ""
+    return urllib.parse.urlparse(url).netloc.split(":")[0].lower()
 
 
 def is_internal(domain: str) -> bool:
     d = (domain or "").lower()
-    return d in INTERNAL_DOMAINS or d.endswith(".x.com") or "nitter" in d
+    return d in INTERNAL_DOMAINS or d.endswith(".x.com")
 
 
 def select_link(urls: list[str]) -> str:
     expanded = []
     for u in urls:
-        try:
-            expanded.append(expand_url(u))
-        except Exception:
-            expanded.append(u)
+        expanded.append(expand_url(u))
     for u in expanded:
         host = netloc_of(u)
         for my in MY_DOMAINS:
@@ -840,7 +835,6 @@ def compose_caption(
     text: str,
     link: str,
     *,
-    has_photo: bool,
     log_fn: LogFn = None,
     max_chars: int | None = None,
 ) -> str:
@@ -876,14 +870,13 @@ def compose_caption(
     return cap
 
 
-def state_path(platform: str = "bluesky") -> Path:
-    name = re.sub(r"[^a-z0-9]+", "", (platform or "bluesky").lower()) or "bluesky"
-    return STATE_DIR / f"state_{name}.json"
+def state_path() -> Path:
+    return STATE_DIR / "state.json"
 
 
-def load_state(log_fn: LogFn = None, platform: str = "bluesky") -> dict:
+def load_state(log_fn: LogFn = None) -> dict:
     empty = {"seen_ids": [], "last_id": "", "seen_images": []}
-    path = state_path(platform)
+    path = state_path()
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -893,7 +886,7 @@ def load_state(log_fn: LogFn = None, platform: str = "bluesky") -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            raise ValueError("state ist kein Objekt")
+            raise TypeError("state ist kein Objekt")
         data.setdefault("seen_ids", [])
         data.setdefault("last_id", "")
         data.setdefault("seen_images", [])
@@ -921,14 +914,14 @@ def load_state(log_fn: LogFn = None, platform: str = "bluesky") -> dict:
         raise RuntimeError(f"{path.name} unlesbar: {exc}") from exc
 
 
-def save_state(st: dict, platform: str = "bluesky") -> None:
+def save_state(st: dict) -> None:
     seen = st.get("seen_ids") or []
     imgs = st.get("seen_images") or []
     if isinstance(seen, list):
         st["seen_ids"] = seen[-SEEN_LIMIT:]
     if isinstance(imgs, list):
         st["seen_images"] = imgs[-IMAGE_SEEN_LIMIT:]
-    path = state_path(platform)
+    path = state_path()
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -1006,7 +999,7 @@ def select_new_posts(posts: list[Post], st: dict) -> list[Post]:
     for p in new:
         try:
             age = (now - snowflake_time(p.id)).total_seconds()
-        except Exception:
+        except (OSError, OverflowError, ValueError):
             logging.getLogger(__name__).debug(
                 "Zeitstempel für Post %s konnte nicht gelesen werden",
                 p.id,

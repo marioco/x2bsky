@@ -1,5 +1,6 @@
+# Managed by x2bsky installer
 [Unit]
-Description=X-to-Social einmal pro Stunde
+Description=X-to-Bluesky einmal pro Stunde
 
 [Timer]
 OnCalendar=hourly
